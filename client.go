@@ -1,8 +1,7 @@
-package main
+package client
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -22,8 +21,6 @@ const (
 	allMessagesURI   = "/threads/{threadID}/messages"
 	singleMessageURI = "/threads/{threadID}/messages/{messageID}"
 	userURI          = "/users"
-
-	userDetailsURI = "/users/{userID}"
 )
 
 //Link is a link
@@ -59,6 +56,11 @@ type User struct {
 }
 
 var cache map[string]string
+
+const (
+	withAuth    = true
+	withoutAuth = false
+)
 
 func addName(href string, name string) {
 	cache[href] = name
@@ -96,6 +98,28 @@ func setMyUser(ru User) {
 	myUser.Secret = ru.Secret
 }
 
+var (
+	errRequestFailed = errors.New("The request failed")
+)
+
+func readFromResponse(res *http.Response, dat interface{}, okStatus int) error {
+	defer res.Body.Close()
+
+	if res.StatusCode != okStatus {
+		log.Println("[readFromResponse] Status not good, got ", res.Status)
+		return errRequestFailed
+	}
+
+	if dat != nil {
+		b, err := ioutil.ReadAll(res.Body)
+		if err != nil {
+			return err
+		}
+		json.Unmarshal(b, dat)
+	}
+	return nil
+}
+
 /*Checks if the name and password in myUser is a valid user, if is then sets its
 secret and uid
 */
@@ -116,16 +140,10 @@ func checkUser() bool {
 		return false
 	}
 
-	defer res.Body.Close()
-
-	if res.StatusCode != http.StatusOK {
+	var ru User
+	if err = readFromResponse(res, &ru, http.StatusOK); err != nil {
 		return false
 	}
-
-	b, _ := ioutil.ReadAll(res.Body)
-
-	var ru User
-	json.Unmarshal(b, &ru)
 
 	setMyUser(ru)
 
@@ -178,32 +196,22 @@ func register() {
 
 func newUser() bool {
 
-	req, err := http.NewRequest("POST", host+userURI, bytes.NewBufferString(`
-		{
-			"name":"`+myUser.Name+`",
-			"password":"`+myUser.Pass+`"
-		}`))
+	res, err := requestPOST(userURI, []byte(`
+	{
+		"name":"`+myUser.Name+`",
+		"password":"`+myUser.Pass+`"
+	}`), withoutAuth)
 	if err != nil {
-		log.Println("[newUser] new request error : ", err)
-	}
-
-	c := http.DefaultClient
-	res, err := c.Do(req)
-	if err != nil {
-		log.Println("[newUser] do error : ", err)
+		log.Println("[newUser] requestPOST error : ", err)
 		return false
 	}
-
-	defer res.Body.Close()
-
-	if res.StatusCode != http.StatusCreated {
-		return false
-	}
-
-	b, _ := ioutil.ReadAll(res.Body)
 
 	var ru User
-	json.Unmarshal(b, &ru)
+
+	if err = readFromResponse(res, &ru, http.StatusCreated); err != nil {
+		log.Println("[newUser] readFromResponse error : ", err)
+		return false
+	}
 
 	setMyUser(ru)
 
@@ -250,29 +258,18 @@ func displayAllThreads() {
 
 //get all threads that were created before the start
 func loadAllThreads() {
-	c := http.DefaultClient
-	req, err := http.NewRequest("GET", host+threadsURI, nil)
-	if err != nil {
-		log.Println("[displayAllThreads] NewRequest error: ", err)
-		return
-	}
-	req.SetBasicAuth(myUser.UID, myUser.Secret)
 
-	res, err := c.Do(req)
+	res, err := requestGET(threadsURI, withAuth)
 	if err != nil {
-		log.Println("[displayAllThreads] Do error: ", err)
-		return
-	}
-	defer res.Body.Close()
-
-	b, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		log.Println("[displayAllThreads] ReadAll error: ", err)
+		log.Println("[loadAllThreads] requestGET error: ", err)
 		return
 	}
 
 	var rt AllThreads
-	json.Unmarshal(b, &rt)
+	if err = readFromResponse(res, &rt, http.StatusOK); err != nil {
+		log.Println("[loadAllThreads] readFromResponse error: ", err)
+		return
+	}
 
 	myUser.Threads = rt.Threads
 }
@@ -286,103 +283,61 @@ func createNewThread() {
 	for i > 0 {
 		fmt.Println("Enter participants link")
 		fmt.Scanf("%s", &s)
-		l := Link{
-			Href: s,
-		}
-		t.Participants = append(t.Participants, l)
+		t.Participants = append(t.Participants, Link{Href: s})
 		i--
 	}
 
 	b, _ := json.Marshal(&t)
-	req, err := http.NewRequest("POST", host+threadsURI, bytes.NewBuffer(b))
+
+	res, err := requestPOST(threadsURI, b, withAuth)
 	if err != nil {
-		log.Println("[createNewThread] NewRequest error: ", err)
-		return
-	}
-	req.SetBasicAuth(myUser.UID, myUser.Secret)
-	req.Header.Set("Content-Type", "application/json")
-
-	c := http.DefaultClient
-
-	res, err := c.Do(req)
-	if err != nil {
-		log.Println("[createNewThread] Do error: ", err)
-		return
-	}
-	defer res.Body.Close()
-
-	if res.StatusCode != http.StatusCreated {
-		log.Println("[createNewThread] Could not create message")
-		return
-	}
-
-	b, err = ioutil.ReadAll(res.Body)
-	if err != nil {
-		log.Println("[createNewThread] ReadAll error: ", err)
+		log.Println("[createNewThread] requestPOST error: ", err)
 		return
 	}
 
 	var rt Thread
-	json.Unmarshal(b, &rt)
+	if err = readFromResponse(res, &rt, http.StatusCreated); err != nil {
+		log.Println("[createNewThread] readFromResponse error: ", err)
+		return
+	}
 
 	myUser.Threads = append(myUser.Threads, rt.Link)
 }
 
 func getThreadParticipants(l Link) {
-	c := http.DefaultClient
-	req, err := http.NewRequest("GET", host+l.Href, nil)
-	if err != nil {
-		log.Println("[getThreadParticipants] NewRequest error: ", err)
-		return
-	}
-	req.SetBasicAuth(myUser.UID, myUser.Secret)
 
-	res, err := c.Do(req)
+	res, err := requestGET(l.Href, withAuth)
 	if err != nil {
-		log.Println("[getThreadParticipants] Do error: ", err)
-		return
-	}
-	defer res.Body.Close()
-
-	b, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		log.Println("[getThreadParticipants] ReadAll error: ", err)
+		log.Println("[getThreadParticipants] requestGET error: ", err)
 		return
 	}
 
 	var rt Thread
-	json.Unmarshal(b, &rt)
+	if err = readFromResponse(res, &rt, http.StatusOK); err != nil {
+		log.Println("[getThreadParticipants] readFromResponse error: ", err)
+		return
+	}
 
 	for _, p := range rt.Participants {
-		log.Println(p)
-		addName(p.Href, getUsername(p))
+		u := getUsername(p)
+		fmt.Println(u)
+		addName(p.Href, u)
 	}
 }
 
 func getUsername(l Link) string {
-	c := http.DefaultClient
-	req, err := http.NewRequest("GET", host+l.Href, nil)
-	if err != nil {
-		log.Println("[getThreadParticipants] NewRequest error: ", err)
-		return ""
-	}
-	req.SetBasicAuth(myUser.UID, myUser.Secret)
 
-	res, err := c.Do(req)
+	res, err := requestGET(l.Href, withAuth)
 	if err != nil {
-		log.Println("[getThreadParticipants] Do error: ", err)
-		return ""
-	}
-	defer res.Body.Close()
-
-	b, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		log.Println("[getThreadParticipants] ReadAll error: ", err)
+		log.Println("[getUsername] requestGET error: ", err)
 		return ""
 	}
 
 	var ru User
-	json.Unmarshal(b, &ru)
+	if err = readFromResponse(res, &ru, http.StatusOK); err != nil {
+		log.Println("[getUsername] readFromResponse error: ", err)
+		return ""
+	}
 
 	return ru.Name
 }
@@ -445,6 +400,7 @@ func displayMessages(l Link, justNew bool) {
 }
 
 func loadMessages(l Link, new bool) []Message {
+
 	c := http.DefaultClient
 	req, err := http.NewRequest("GET", host+l.Href+"/messages", nil)
 	if err != nil {
@@ -464,20 +420,12 @@ func loadMessages(l Link, new bool) []Message {
 		log.Println("[loadMessages] Do error: ", err)
 		return nil
 	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		log.Println("[loadMessage] Could not get message")
-		return nil
-	}
-
-	b, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		log.Println("[loadMessages] ReadAll error: ", err)
-		return nil
-	}
 
 	var m []Message
-	json.Unmarshal(b, &m)
+	if err = readFromResponse(res, &m, http.StatusOK); err != nil {
+		log.Println("[loadMessage] readFromResponse")
+		return nil
+	}
 	return m
 }
 
@@ -493,22 +441,14 @@ func sendMessage(con string, t Link) {
 	msg.Time = time.Now().Format(time.RFC3339)
 
 	b, _ := json.Marshal(&msg)
-	req, err := http.NewRequest("POST", host+t.Href+"/messages", bytes.NewBuffer(b))
+
+	res, err := requestPOST(t.Href+"/messages", b, withAuth)
 	if err != nil {
-		log.Println("[sendMessage] NewRequest error: ", err)
+		log.Println("[sendMessage] requestPOST error: ", err)
 		return
 	}
-	req.SetBasicAuth(myUser.UID, myUser.Secret)
-	req.Header.Set("Content-Type", "application/json")
 
-	c := http.DefaultClient
-
-	res, err := c.Do(req)
-	if err != nil {
-		log.Println("[sendMessage] Do error: ", err)
-		return
-	}
-	if res.StatusCode != http.StatusCreated {
+	if err = readFromResponse(res, nil, http.StatusCreated); err != nil {
 		log.Println("[sendMessage] Could not create message")
 		return
 	}
@@ -520,6 +460,9 @@ func getMessages() {
 func init() {
 	flag.StringVar(&host, "host", "localhost:8080", "The host of the server")
 	flag.Parse()
+	if host[:4] != "http" {
+		host = "http://" + host
+	}
 	cache = make(map[string]string)
 }
 
